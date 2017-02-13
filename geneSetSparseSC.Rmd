@@ -1,0 +1,528 @@
+---
+title: "Supervised Non Overlapping Single Cell Gene Set Clustering"
+author: "Hadrien Lorenzo, Samson Koelle, Boris Hejblum, Raphaël Gottardo, Rodolphe Thiebaut"
+date: "7 février 2017"
+fontsize: 9pt
+output:
+  pdf_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+    keep_tex: true
+    fig_caption: yes
+header-includes:
+  - \usepackage{color}
+  - \usepackage{xcolor}
+bibliography: references.bib
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r parameters,echo=F}
+idTest <- 7:11
+nBCells <- 1000
+minCountMean <- 1
+alpha.f <- 0.1
+rangeCols <- c('black','red', 'orange', 'green', 'blue','maroon1')
+col.l <- colorRampPalette(rangeCols)(length(idTest))
+keepX <- 50
+ncomp <- length(idTest)
+save("idTest","nBCells","minCountMean","alpha.f","rangeCols","col.l","keepX","ncomp",file="data/parameters.RData")
+
+## Functions
+doPCA <- function(X,ncomp=3,niter=20){
+  getu <- function(X,niter){
+    u <- scale(rnorm(n = ncol(X) ))
+    for(i in 1:niter){
+      v <- X%*%u
+      u1 <- crossprod(X,v)
+      u <- u1/ base::norm(u1,"2")
+    }
+    return(list(u=u,v=v))
+  }
+  Res <- getu(X,niter)
+  U <- Res$u
+  V <- Res$v
+  Xi <- X
+  for(k in 1:(ncomp-1)){
+    Xi <- Xi - tcrossprod(Res$v,Res$u)
+    Res <- getu(Xi,niter)
+    U <- cbind(U,Res$u)
+    V <- cbind(V,Res$v)
+  }
+  return(list(u=U,v=V))
+}
+
+```
+
+\newpage
+
+# Context
+
+## Idea
+
+The main idea of that work is to define gene sets which would describe given cell types according. This is a supervised approach. We work on different types of genes such as **b-cells**, **cd14-monocytes**, **cd34**, **cd4-t-helper**, **cd56-nk** or **cytotoxic-t**.  
+
+Those different cell types have common and different pathways of expression, we think it might be interesting to find the pathways which are characteristic to one type of cells. Which means that we want to find genes which are activated for one type of cells and only for that type of cells.  
+
+## Technology \& data
+
+Currently, we have found the **Single cell RNA-Seq** to be able to show those pathways, our wish has been to find enough well designed human single cell RNA-Seq datasets as to perform coherent analyses.  
+
+The [\textcolor{blue}{\textbf{10X}}](http://www.10xgenomics.com/) technology permits to sequence a large amount of cells and has built  [\textcolor{blue}{\textbf{public dataset}}](http://www.10xgenomics.com/datasets/).  
+
+Indeed, through [@zheng2016massively], the authors depict the quality of the generated data. We have had access to 29 dataset, the table \ref{tab:10XOverview} shows some of the properties of the data avalable on the data, the ones used by [@zheng2016massively]. Those information are also disponible on the website, other useful information are also avalable in the table avalable [\textcolor{blue}{\textbf{here}}](https://assets.contentful.com/an68im79xiti/hY0L6HyyvmGO2EYqmg0Aa/66337df368cfc57c57b9891b1048709f/zheng_nat_comm_2017_supp_tables.xlsx), this is a \texttt{.xls} file which recaps most of the information on the different datasets. We recall here that we are only concerned by human dataset and this is why **ercc** does not show any relevant inforamtion, this is also why some of the information that you can find in the \texttt{.xls} file (sheet 1 especially) will not be the same as in \ref{tab:10XOverview} : some cells came from mouse also.
+
+```{r xtable, fig.height=9, fig.width=5, results="asis",echo=F}
+# source("../R/functions.R")
+load("data/listOfSamples.RData")
+listOfNames <- unlist(lapply(listOfSamples,FUN = function(ll){unlist(strsplit(ll,split = "_filtered_gene_bc_matrices"))[1]}))
+# dadaDims <- lapply(X = listOfSamples,FUN = function(fifi){
+#   dimy = tryCatch({
+#     path <- paste("data/",fifi,"/filtered_matrices_mex/hg19/matrix.mtx",sep="")
+#     mat <- Matrix::t(Matrix::readMM(path))
+#     colsumm <- 
+#     c(dim(mat),round(length(which(Matrix::colSums(mat)!=0))/ncol(mat)*100))
+#   }, error = function(e) {
+#     NA
+#   }, warning = function(w) {
+#     NA
+#   }
+#   )
+#   return(dimy)
+# })
+# save("dadaDims",file = "Markdown/data/dimsDataset.RData")
+load("data/dimsDataset.RData")
+mat <- matrix(NA,nrow = length(listOfNames),ncol = 3)
+for(i in 1:length(listOfNames)){
+  mat[i,] <- dadaDims[[i]]
+}
+rownames(mat) <- listOfNames
+colnames(mat) <- c("Number of Cells","Number of Genes","Proportion of non null genes (%)")
+print(xtable::xtable(mat,align="l|ccc",digits = rep(0,ncol(mat)+1),
+                     caption = "Structure of the Single Cell data for humans avalaible on the 10X website",
+                     label = "tab:10XOverview"),comment=F)
+
+```
+
+\newpage
+
+# Import the data
+
+The data have a structure that might be opened with a tool called \texttt{cellranger}\footnote{See  [\textcolor{blue}{\textbf{here}}](https://support.10xgenomics.com/single-cell/software/pipelines/latest/output/matrices) to get further information over the \texttt{cellranger} tool.}, we were not able to use it. But actually the R Package \texttt{Matrix} has permitted to open such datasets. We are talking about \texttt{.mtx} files which use sparse way of compressing the data matrix, very important in the context of Single Cell Data.
+
+## Which datasets ?
+
+As we want relevant results... we have chosen to work on the datasets detailed in table \ref{tab:10XJustWork}. Which means that we have **K** cell types, as  
+
+```{r numberClusters, echo=FALSE}
+load("data/parameters.RData")
+cat(paste("K=",length(idTest),sep=""))
+```
+
+```{r xtable2, fig.height=9, fig.width=5, results="asis",echo=F}
+# source("../R/functions.R")
+load("data/listOfSamples.RData")
+load("data/parameters.RData")
+listOfNames <- unlist(lapply(listOfSamples,FUN = function(ll){
+  unlist(strsplit(ll,split = "_filtered_gene_bc_matrices"))[1]}))[idTest]
+load("data/dimsDataset.RData")
+mat <- matrix(NA,nrow = length(listOfNames),ncol = 3)
+for(i in 1:length(listOfNames)){
+  mat[i,] <- dadaDims[[idTest[i]]]
+}
+rownames(mat) <- listOfNames
+colnames(mat) <- c("Number of Cells","Number of Genes",
+                   "Proportion of non null genes (%)")
+print(xtable::xtable(mat,align="l|ccc",digits = rep(0,ncol(mat)+1),
+                     caption = "Datasets used in the work",
+                     label = "tab:10XJustWork"),comment=F)
+
+```
+
+## How many cells to be taken into account ?
+
+As we want to carry quick and flexible analyses, we will not work on the all cells. We have decided to use an amount of $nb_{cells}$ constant for the **K** datasets such as
+
+```{r nBCells, echo=FALSE}
+load("data/parameters.RData")
+cat(paste("nb_cells=",nBCells,sep=""))
+```
+
+
+## Which genes to be watched ?
+
+As we work on RNA-Seq, and even more with Single Cell, it is important to not put all the genes in th to be studied dataset. The common way is to use genes with a mean value higher than a particular level, called here $count_{min}$ and taken equal to 
+
+```{r minCountMean, echo=FALSE}
+load("data/parameters.RData")
+cat(paste("count_min=",minCountMean,sep=""))
+```
+
+The mean is taken over the current dataset for each of the **K** datasets previously chosen.
+
+```{r GenerateDatas,echo=F}
+load("data/listOfSamples.RData")
+load("data/parameters.RData")
+listOfNames <- unlist(lapply(listOfSamples,FUN = function(ll){
+  unlist(strsplit(ll,split = "_filtered_gene_bc_matrices"))[1]}))
+## Select nBCells in each dataset
+dadaLabels <- lapply(X = 1:length(idTest),FUN = function(i,listOfSamples,listOfNames,
+                                               nBCells){
+  idTi <- idTest[i]
+  path <- paste("../data/",listOfSamples[idTi],
+                "/filtered_matrices_mex/hg19/matrix.mtx",sep="")
+  mat <- Matrix::t(Matrix::readMM(path))
+  if(length(nBCells)==1){
+    labels <- rep(listOfNames[idTi],nBCells)
+    out <- list(dada=mat[sample(x = 1:nrow(mat),size = nBCells,replace = F),],
+              labels=labels)
+  }else{
+    labels <- rep(listOfNames[idTi],nBCells[i])
+    out <- list(dada=mat[sample(x = 1:nrow(mat),size = nBCells[i],replace = F),],
+              labels=labels)
+  }
+  
+  return(out)
+},listOfSamples,listOfNames,nBCells)
+save("dadaLabels",file = "data/dadaLabels.RData")
+y <-  as.factor(do.call(what = c,args = lapply(X = dadaLabels,
+FUN = function(dadai){dadai$labels})))
+save("y",file = "data/y.RData")
+## Select genes with more than minCountMean as a mean expression
+no0GenesI <- lapply(1:length(dadaLabels),
+                    FUN = function(i,dadaLabels,nBCells){
+                      if(length(nBCells)==1){
+                        which(Matrix::colSums(dadaLabels[[i]]$dada)/nBCells>minCountMean)
+                      }else{
+                        which(Matrix::colSums(dadaLabels[[i]]$dada)/nBCells[i]>minCountMean)
+                      }
+                    },
+                    dadaLabels,nBCells
+)
+no0Genes <- sort(unique(do.call(what = c,no0GenesI)))
+X0 <- do.call(what = rbind,args = lapply(X = dadaLabels,FUN = function(dadai){
+  dadai$dada}))[,no0Genes]
+save("X0",file = "data/X0.RData")
+mat <- matrix(NA,nrow = length(idTest)*ncol(X0),ncol = 3)
+for(i in 1:length(idTest)){
+  idI <- ((i-1)*ncol(X0)+1):(i*ncol(X0))
+  mat[idI,1] <- listOfNames[idTest[i]]
+  mat[idI,2] <- colMeans(as.matrix(log(1+X0[idI,])))
+  mat[idI,3] <- matrixStats::colSds(as.matrix(log(1+X0[idI,])))
+}
+mat <- as.data.frame(mat)
+names(mat) <- c("cell_type","Mean","Sd")
+mat$Mean <- as.numeric(levels(mat$Mean)[mat$Mean])
+mat$Sd <- as.numeric(levels(mat$Sd)[mat$Sd])
+save("mat",file = "data/matNiceSdMeanPlot.RData")
+```
+
+According to the fact that not all the genes will have a min count higher that $count_{min}$ for the all K datasets, it would be interesting to check which genes are selected for which datasets. We can look at this through a Venn Diagram on the sets of selected genes for each cell type :
+
+```{r LookAtVenn,echo=F}
+load("data/listOfSamples.RData")
+load("data/parameters.RData")
+listOfNames <- unlist(lapply(listOfSamples,FUN = function(ll){
+  unlist(strsplit(ll,split = "_filtered_gene_bc_matrices"))[1]}))
+load("data/y.RData")
+load("data/X0.RData")
+load("data/dadaLabels.RData")
+no0GenesI <- lapply(dadaLabels,FUN = function(dadai){which(Matrix::colSums(dadai$dada)/nBCells>minCountMean)})
+venn.plot <- VennDiagram::venn.diagram(
+  x = no0GenesI,
+  category.names = paste(listOfNames[idTest],"\n",unlist(lapply(X = no0GenesI,FUN = length)),"genes"),
+  filename = "figures/venndiagram.png",
+  imagetype="png",
+  output = TRUE,
+  height = 1000,
+  width = 1000,
+  resolution = 300,
+  compression = 'lzw',
+  units = 'px',
+  lwd = 5,
+  lty = 'blank',
+  fill = col.l[1:length(idTest)],
+  cex =0.5,
+  fontface = "bold",
+  fontfamily = "sans",
+  cat.cex = 0.7,
+  cat.fontface = "bold",
+  cat.default.pos = "outer",
+  main = "",
+  cat.pos=1:length(idTest),
+  cat.dist=0.07,
+  cat.col=col.l[1:length(idTest)],
+  cat.fontfamily = "sans"
+)
+
+
+
+```
+![Venn Diagramm of the genes with a mean count higher than $count_{min}$ in each of the **K** classes](figures/venndiagram.png)
+
+That diagram shows that **CD34** have more very well explained genes than others. If we take the reunion of the **K** list of genes with a mean count higher than $count_{min}$, we get a total of
+
+```{r numberOfGenesAll, echo=FALSE}
+load("data/X0.RData")
+cat(ncol(X0),"genes")
+```
+
+Table \ref{tab:selectedProp} shows that **CD34** is definitly more represented through the different levels of gene expression.
+
+```{r lookAtProp,fig.height=9, fig.width=5, results="asis",echo=F}
+load("data/listOfSamples.RData")
+load("data/parameters.RData")
+listOfNames <- unlist(lapply(listOfSamples,FUN = function(ll){
+  unlist(strsplit(ll,split = "_filtered_gene_bc_matrices"))[1]}))
+load("data/y.RData")
+load("data/X0.RData")
+load("data/dadaLabels.RData")
+no0GenesI <- lapply(dadaLabels,FUN = function(dadai){which(Matrix::colSums(dadai$dada)/nBCells>minCountMean)})
+mat <- matrix(NA,nrow = length(idTest),ncol = 4)
+mat[,1] <- unlist(lapply(X = no0GenesI,FUN = length))
+mat[,2] <- round(unlist(lapply(X = no0GenesI,FUN = length))/ncol(X0)*100)
+mat[,3] <- unlist(lapply(1:length(no0GenesI), function(n) length(setdiff(no0GenesI[[n]], unlist(no0GenesI[-n])))))
+mat[,4] <- round(as.numeric(mat[,3])/ncol(X0)*100)
+mat <- as.data.frame(mat)
+row.names(mat) <- listOfNames[idTest]
+colnames(mat) <- c("Total number","Total proportion (%)","No Overlap number","No Overlap proportion (%)")
+print(xtable::xtable(mat,align="l|cc|cc",digits = rep(0,ncol(mat)+1),
+                     caption = "Main details of the dataset for the chosen parameters",
+                     label = "tab:selectedProp"),comment=F)
+```
+
+## Summary
+
+Once those choices has been applied we get a matrix of dimensions $(n,p)$ as 
+```{r dimMatrix, echo=FALSE}
+load("data/X0.RData")
+cat(paste("(n,p)=(",paste(dim(X0),collapse=","),")",collapse=",",sep=""))
+```
+
+Figure \ref{fig:dispProf} shows the dispersion for each gene selected in the **K** different situations. We have normalised the counts with a \texttt{log} transformation \footnote{Because all those cells are from the same very sample and we do not know anything about replicates.}, more precisely
+
+\[count \rightarrow log(1+count),\]
+
+It seems that **CD56** shows high variability for the high counts while **CD14** and **B-cells** seem to shrink their variability in that high counts region. In the medium counts region, the one in which counts are the most variable, it seems that **CD56** show huge variability, but also **CD34** and **CD4**.
+
+```{r plotVar, fig.height=8, fig.width=13,echo=F,message=FALSE, warning=FALSE,fig.cap="Dispersion profile \\label{fig:dispProf}"}
+load("data/X0.RData")
+load("data/y.RData")
+load("data/listOfSamples.RData")
+load("data/matNiceSdMeanPlot.RData")
+load("data/parameters.RData")
+listOfNames <- unlist(lapply(listOfSamples,FUN = function(ll){
+  unlist(strsplit(ll,split = "_filtered_gene_bc_matrices"))[1]}))
+
+p <- ncol(X0)
+colAlpha <- adjustcolor(col.l[as.numeric(y)], alpha.f = alpha.f)
+
+matVisu <- mat[sample(1:nrow(mat),size = nrow(mat),replace = F),]
+
+sp <-ggplot2::ggplot(matVisu, ggplot2::aes(x=Mean, y=Sd, color=cell_type)) + 
+  ggplot2::geom_point(size=3,shape=19) +
+  ggplot2::scale_color_manual(breaks = listOfNames[idTest],
+                              values = adjustcolor(col.l[1:length(idTest)], alpha.f = alpha.f*5)) +
+  ggplot2::ggtitle(paste("Standard deviation versus Mean of the log(1+count) \n",
+                         "for each of the",p,"genes","\n for the",
+                         length(idTest),"selected datasets")) +
+  ggplot2::xlab("Mean of log(1+count)") +
+  ggplot2::ylab("Standard deviation of log(1+count)")
+print(sp)
+
+```
+
+\newpage
+
+# Unsupervised Analysis
+
+## PCA for \textit{Principal Component Analysis}
+
+Indeed, PCA is of a great help to show colinear variables in the context of a large quantity of variables, which is the case here. We have decided to compute the **K+1** first components of that dataset and plotted the corresponding variates on figure \ref{fig:pcaBiplots}. As we have **K** cell types to discriminante, it has been interesting to check the component **K+1**, at least, to check if one cell type is discriminate on that very last compoent.
+
+```{r pca,echo=F,fig.height=8, fig.width=8,fig.cap="PCA biplots \\label{fig:pcaBiplots}"}
+load("data/X0.RData")
+load("data/y.RData")
+load("data/listOfSamples.RData")
+load("data/matNiceSdMeanPlot.RData")
+load("data/parameters.RData")
+listOfNames <- unlist(lapply(listOfSamples,FUN = function(ll){
+  unlist(strsplit(ll,split = "_filtered_gene_bc_matrices"))[1]}))
+
+X <- scale(log(1+X0))
+save("X",file="data/X.RData")
+resPCA <- doPCA(X,ncomp = length(idTest)+1,niter = 50)
+variates <- as.data.frame(resPCA$v)
+varK <- colMeans((crossprod(X)%*%resPCA$u)/resPCA$u)
+propVar <- round(varK/sum(varK)*100)
+names(variates) <- paste("PC",1:ncol(variates),"\n (var : ",propVar,"% explained)",sep="")
+colAlpha <- adjustcolor(col.l[as.numeric(y)], alpha.f = alpha.f*4)
+plot(variates,col=colAlpha,pch=16,cex=0.2)
+
+```
+
+```{r pcaDensity,echo=F,fig.height=8, fig.width=20,fig.cap="PCA density plots \\label{fig:pcadensityplots}"}
+  proj <- variates
+   colS <- adjustcolor(col.l[1:length(idTest)], alpha.f = alpha.f*7)
+ posS <- matrix(1:(ceiling(sqrt(ncol(proj)))^2),nrow = ceiling(sqrt(ncol(proj))),byrow = T)
+ for(i in 1:ncol(proj)){
+   proji <- data.frame(points=proj[,i],gp=as.character(levels(y)[y]))
+   dp <- lattice::densityplot(~points,data=proji,groups = gp,
+                        plot.points = FALSE,
+                        par.settings = list(superpose.line = list(col=col.l)),
+                        auto.key = list(space = "right"),
+                        col=col.l,lwd=2.5,ylab="Density",xlab=paste("Comp",i))
+   pos <- as.numeric(which(posS==i,arr.ind = T))
+   if( i !=ncol(proj)){
+     print(dp, split = c(pos[2], pos[1], nrow(posS), ncol(posS)), more = TRUE)
+   }else{
+     print(dp, split = c(pos[2], pos[1], nrow(posS), ncol(posS)))
+   }
+ }
+
+```
+
+The variance explained are actually computed on the **K** first components, this is why this is so huge. We can see also taht the first component describes more the original data than does the second component.  
+
+Whatever, we can see than the $1^{st}$ and the $2^{nd}$ components are particularly capable of describing two different populations **CD34** and **CD56**. We recall, according to \ref{tab:selectedProp} that a large proportion of genes show large expressions for **CD34**. Consequently, **CD56** show genes with large expressions.  
+
+It also seems that the $3^{rd}$ component could be an expression od **CD14** but that group seems to have an expression close to the expression of the **CD34**.  
+
+The $4^{th}$ component does not discriminate a special type of cells. Maybe that component shows cellular variability due to the method of measure or the normalization and/or thresholding method that we used.  
+
+Whatever, the $5^{th}$ component is able to show a discrimination of **CD4** and **B-cells**.  
+
+Finally, the last component computed does not discriminate any cluster information, and this is why the las line of the plot is so appealling to check the univariate discrimination of each component.  
+
+A question could be, would an efficient unsupervised clustering algorithm find clusters ? We could ask Chariff!  
+
+Actually, this cannot be an answer to the question here. We want to find groups of genes which discriminate the different cell types. In that sense this is a lack of power of considering most of the variance along the first component and an useless $4^{th}$ component. This is why we have decided to try **sparse** methods with components, such as \texttt{SPLS-DA} ([@chung2010sparse] and [@le2011sparse]) for \textit{Sparse Partial Least Square Discriminant Analysis} or SDA ([@clemmensen2011sparse]) for \textit{Sparse Discriminant Analysis}.
+
+\newpage
+
+# Supervised Analysis
+
+## SPLS-DA
+
+As a proof of concept we will use the \texttt{mixOmics} package, we have used a common $keep_X$ to the **K** components 
+
+```{r keepxSPLSDA, echo=FALSE}
+load("data/parameters.RData")
+cat(paste("keep_X=",keepX,sep=""))
+```
+
+And we have constructed $ncomp$ components, here
+
+```{r ncompSPLSDA, echo=FALSE}
+load("data/parameters.RData")
+cat(paste("ncomp=",ncomp,sep=""))
+```
+
+```{r splsda,echo=F,fig.height=8, fig.width=8,fig.cap="SPLSDA biplots \\label{fig:splsdaBiplots}"}
+ load("data/X.RData")
+ load("data/y.RData")
+ load("data/listOfSamples.RData")
+ load("data/matNiceSdMeanPlot.RData")
+ load("data/parameters.RData")
+ splsda.model <- mixOmics::splsda(X = X,Y = y,
+                                  ncomp=ncomp,keepX=rep(keepX,ncomp))
+ beta <- splsda.model$loadings$X
+ genesSelectedMat <- apply(X = beta,MARGIN = 2,FUN = function(e){
+   which(e!=0)
+ })
+ if(is.matrix(genesSelectedMat)){
+   geneSel <- list()
+   for(i in 1:ncol(genesSelectedMat)){
+     geneSel[[i]] <- genesSelectedMat[,i]
+   }
+ }else{
+   geneSel <- genesSelectedMat
+ }
+ 
+ venn.plot <- VennDiagram::venn.diagram(
+  x = geneSel,
+  category.names = paste("Comp",1:length(geneSel)),
+  filename = "figures/venndiagramSPLSDA.png",
+  imagetype="png",
+  output = TRUE,
+  height = 1000,
+  width = 1000,
+  resolution = 300,
+  compression = 'lzw',
+  units = 'px',
+  lwd = 5,
+  lty = 'blank',
+  fill="gray",
+  cex =0.5,
+  fontface = "bold",
+  fontfamily = "sans",
+  cat.cex = 0.5,
+  cat.fontface = "bold",
+  cat.default.pos = "outer",
+  main = "",
+  cat.fontfamily = "sans"
+)
+ 
+  proj <- as.data.frame(X%*%beta)
+  colAlpha <- adjustcolor(col.l[as.numeric(y)], alpha.f = alpha.f*4)
+  plot(proj,col=colAlpha,pch=16,cex=0.2)
+```
+
+```{r splsdaDensity,echo=F,fig.height=8, fig.width=20,fig.cap="SPLSDA density plots \\label{fig:splsdadensityplots}"}
+  
+   colS <- adjustcolor(col.l[1:length(idTest)], alpha.f = alpha.f*7)
+ posS <- matrix(1:(ceiling(sqrt(ncol(proj)))^2),nrow = ceiling(sqrt(ncol(proj))),byrow = T)
+ for(i in 1:ncol(proj)){
+   proji <- data.frame(points=proj[,i],gp=as.character(levels(y)[y]))
+   dp <- lattice::densityplot(~points,data=proji,groups = gp,
+                        plot.points = FALSE,
+                        par.settings = list(superpose.line = list(col=col.l)),
+                        auto.key = list(space = "right"),
+                        col=col.l,lwd=2.5,ylab="Density",xlab=paste("Comp",i))
+   pos <- as.numeric(which(posS==i,arr.ind = T))
+   if( i !=ncol(proj)){
+     print(dp, split = c(pos[2], pos[1], nrow(posS), ncol(posS)), more = TRUE)
+   }else{
+     print(dp, split = c(pos[2], pos[1], nrow(posS), ncol(posS)))
+   }
+ }
+
+```
+
+
+We can make a few comments on those results :  
+
+ + $1^{st}$ component discriminates **CD34** before others,  
+ + $2^{nd}$ component discriminates **CD56** before others,  
+ + $3^{rd}$ component discriminates **CD14** before others,  
+ + $4^{th}$ component discriminates **CD4** and **B-cells** before others,  
+ + $5^{th}$ component does not seem to descriminate a particular group of cells.  
+
+The following Venn Diagramm gives the behaviors of the different component selected genes.
+
+![Venn Diagramm of the genes selected by the SPLSDA on the **K** first components](figures/venndiagramSPLSDA.png)
+
+
+ 
+
+## SDA
+
+SDA has been introduced 
+
+```{r sda,echo=F,fig.height=8, fig.width=8,fig.cap="SDA biplots \\label{fig:sdaBiplots}"}
+ load("data/X.RData")
+ load("data/y.RData")
+ load("data/listOfSamples.RData")
+ load("data/matNiceSdMeanPlot.RData")
+ load("data/parameters.RData")
+# sda.model <- sparseLDA::sda(x = X,y = y)
+# plot(as.data.frame(X%*%sda.model$beta),col=colAlpha,pch=16,cex=0.5)
+
+```
+
+\newpage
+
+# References
